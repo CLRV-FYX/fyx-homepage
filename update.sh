@@ -47,12 +47,13 @@ show_help() {
 
 选项:
   -h, --help      显示本帮助信息并退出
+  --registry=URL  指定 npm 源（默认: https://registry.npmmirror.com）
   --no-build      仅拉取代码与安装依赖，跳过前端构建 (npm run build)
   --no-install    跳过 npm install
   --force         强制覆盖本地修改（注意：db.json 仍会被自动备份）
 
 示例:
-  ./update.sh                                # 默认从 arena/8cd56a9a-fyx-homepage 拉取更新
+  ./update.sh                                # 默认从 arena/8cd56a9a-fyx-homepage 拉取更新（使用 npmmirror 源）
   ./update.sh main                           # 从 main 分支拉取更新
   ./update.sh arena/8cd56a9a-fyx-homepage    # 显式指定从当前对话分支拉取
   ./update.sh main --no-build                # 更新 main 分支但跳过构建
@@ -62,6 +63,7 @@ EOF
 # 默认分支设置为当前对话分支
 DEFAULT_BRANCH="arena/8cd56a9a-fyx-homepage"
 TARGET_BRANCH=""
+NPM_REGISTRY="https://registry.npmmirror.com"
 SKIP_BUILD=false
 SKIP_INSTALL=false
 FORCE_PULL=false
@@ -72,6 +74,9 @@ for arg in "$@"; do
     -h|--help)
       show_help
       exit 0
+      ;;
+    --registry=*)
+      NPM_REGISTRY="${arg#*=}"
       ;;
     --no-build)
       SKIP_BUILD=true
@@ -206,10 +211,10 @@ CURRENT_COMMIT="$(git rev-parse --short HEAD)"
 CURRENT_COMMIT_MSG="$(git log -1 --pretty=%B | head -n 1)"
 success "代码更新完成！当前版本: ${CURRENT_COMMIT} (\"${CURRENT_COMMIT_MSG}\")"
 
-# 7. 安装依赖
+# 7. 安装依赖（默认使用 npmmirror 镜像源加速）
 if [ "$SKIP_INSTALL" = false ]; then
-  info "正在检查并更新依赖 (npm install) ..."
-  npm install
+  info "正在检查并更新依赖 (npm install --registry=$NPM_REGISTRY) ..."
+  npm install --registry="$NPM_REGISTRY"
   success "依赖更新成功！"
 else
   info "跳过依赖安装 (--no-install)"
