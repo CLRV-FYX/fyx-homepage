@@ -10,12 +10,21 @@
 - **Markdown**：博客正文、公告、简介、动态、回复、评论等所有内容文字全站统一渲染 Markdown
 - **AI 助手**：右下角浮窗；用户可填自己的 API，管理员可配全局 API（OpenAI 兼容，地址以 `/v1` 结尾），支持模型 / 温度 / top_p / max_tokens / 系统提示词多参数
 
-## 启动
+## 启动与更新
 
 ```bash
-npm install        # 安装依赖
+npm install --registry=https://registry.npmmirror.com        # 安装依赖（推荐 npmmirror 国内源加速）
 npm run build      # 构建前端 → dist/
 npm start          # 启动服务（0.0.0.0:9527）
+```
+
+### 一键拉取更新 (update.sh)
+
+`update.sh` 脚本默认已配置使用 `https://registry.npmmirror.com` 镜像源执行 `npm install`。
+
+```bash
+./update.sh                                # 默认从当前对话分支 (arena/8cd56a9a-fyx-homepage) 拉取更新、使用 npmmirror 源安装依赖并构建
+./update.sh main                           # 指定从 main 或其他分支更新
 ```
 
 开发模式（可选）：`npm run dev`（Vite 于 5199，API 代理到 9527）。
