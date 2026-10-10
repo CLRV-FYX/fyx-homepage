@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
-import { Loader2, Send, Settings2, Sparkles, Trash2, X, Zap } from 'lucide-react'
+import { Check, Copy, Loader2, Send, Settings2, Sparkles, Trash2, X, Zap } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import remarkBreaks from 'remark-breaks'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
@@ -12,7 +15,6 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Slider } from '@/components/ui/slider'
 import { Textarea } from '@/components/ui/textarea'
-import { MdInline } from '@/components/Md'
 import type { AiConfig, AiPrefsView } from '@/lib/types'
 
 interface Msg {
@@ -22,11 +24,146 @@ interface Msg {
 
 const LS_MSGS = 'fyx_ai_msgs'
 
+/**
+ * 自动识别并丢弃思考过程：
+ * 1. 过滤已闭合的 <think>...</think>, <thought>...</thought>, <thinking>...</thinking>
+ * 2. 流式阶段或末尾若存在未闭合的思考标签，直接丢弃未闭合标签之后的所有内容
+ * 3. 自动剥离前导空白换行
+ */
+export function stripThinking(text: string, isStreaming = false): string {
+  if (!text) return ''
+  let cleaned = text
+  // 移除所有已闭合的思考块
+  cleaned = cleaned.replace(/<(think|thought|thinking)[^>]*>[\s\S]*?<\/\1>/gi, '')
+  // 流式中或末尾如果存在未闭合的思考标签，丢弃其后所有内容
+  cleaned = cleaned.replace(/<(think|thought|thinking)[^>]*>[\s\S]*$/gi, '')
+  if (isStreaming) {
+    cleaned = cleaned.replace(/<\/?(?:t(?:h(?:i(?:n(?:k(?:i(?:n(?:g)?)?)?)?)?)?)?)?$/i, '')
+  }
+  return cleaned.replace(/^\s+/, '')
+}
+
+/** 完整代码块组件：支持语言指示栏与一键复制功能 */
+function CodeBlock({ language, code }: { language?: string; code: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = () => {
+    navigator.clipboard.writeText(code)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+  return (
+    <div className="my-2.5 overflow-hidden rounded-xl border border-white/10 bg-[#0c0c0c]">
+      <div className="flex items-center justify-between border-b border-white/8 bg-white/4 px-3 py-1.5 text-[11px] text-white/45">
+        <span className="mono uppercase tracking-wider">{language || 'code'}</span>
+        <button
+          onClick={copy}
+          className="flex items-center gap-1.5 text-white/60 hover:text-white transition-colors"
+          aria-label="复制代码"
+        >
+          {copied ? <Check className="size-3 text-emerald-400" /> : <Copy className="size-3" />}
+          <span className="text-[11px]">{copied ? '已复制' : '复制'}</span>
+        </button>
+      </div>
+      <pre className="overflow-x-auto p-3 text-[12px] leading-relaxed mono text-white/90">
+        <code>{code}</code>
+      </pre>
+    </div>
+  )
+}
+
+/** 针对 AI 助手聊天气泡深度优化的 Markdown 渲染组件 */
+function AiMarkdown({ content }: { content: string }) {
+  const text = stripThinking(content)
+  if (!text) return null
+
+  return (
+    <div className="space-y-1.5 text-[13.5px] leading-relaxed break-words text-white/90">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkBreaks]}
+        components={{
+          h1: ({ children }) => (
+            <h1 className="text-base font-bold text-white mt-3 mb-1.5 border-b border-white/10 pb-1">
+              {children}
+            </h1>
+          ),
+          h2: ({ children }) => (
+            <h2 className="text-[14.5px] font-bold text-white mt-2.5 mb-1">
+              {children}
+            </h2>
+          ),
+          h3: ({ children }) => (
+            <h3 className="text-[13.5px] font-semibold text-white/95 mt-2 mb-1">
+              {children}
+            </h3>
+          ),
+          h4: ({ children }) => (
+            <h4 className="text-[13px] font-semibold text-white/90 mt-1.5 mb-1">
+              {children}
+            </h4>
+          ),
+          p: ({ children }) => <p className="my-1 leading-relaxed">{children}</p>,
+          strong: ({ children }) => <strong className="font-bold text-white">{children}</strong>,
+          em: ({ children }) => <em className="italic text-white/90">{children}</em>,
+          del: ({ children }) => <del className="line-through text-white/50">{children}</del>,
+          ul: ({ children }) => <ul className="list-disc pl-5 my-1.5 space-y-1">{children}</ul>,
+          ol: ({ children }) => <ol className="list-decimal pl-5 my-1.5 space-y-1">{children}</ol>,
+          li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+          blockquote: ({ children }) => (
+            <blockquote className="border-l-2 border-[var(--fyx-accent)] pl-3 my-2 text-white/65 italic bg-white/3 py-1 rounded-r">
+              {children}
+            </blockquote>
+          ),
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="text-[var(--fyx-accent)] underline underline-offset-2 hover:opacity-80"
+            >
+              {children}
+            </a>
+          ),
+          code({ className, children, ...props }) {
+            const match = /language-(\w+)/.exec(className || '')
+            const codeString = String(children).replace(/\n$/, '')
+            const isBlock = match || String(children).includes('\n')
+            if (isBlock) {
+              return <CodeBlock language={match ? match[1] : undefined} code={codeString} />
+            }
+            return (
+              <code
+                className="rounded bg-white/10 px-1.5 py-0.5 text-[12px] mono text-[var(--fyx-accent)]"
+                {...props}
+              >
+                {children}
+              </code>
+            )
+          },
+          table: ({ children }) => (
+            <div className="my-2.5 overflow-x-auto rounded-lg border border-white/10">
+              <table className="w-full border-collapse text-left text-[12px]">{children}</table>
+            </div>
+          ),
+          thead: ({ children }) => <thead className="bg-white/6 border-b border-white/10">{children}</thead>,
+          th: ({ children }) => <th className="px-3 py-1.5 font-semibold text-white">{children}</th>,
+          td: ({ children }) => <td className="px-3 py-1.5 border-b border-white/5 text-white/80">{children}</td>,
+          hr: () => <hr className="my-3 border-white/10" />,
+          img: ({ src, alt }) => (
+            <img src={src} alt={alt || ''} className="my-2 max-w-full rounded-lg border border-white/10" />
+          ),
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
 function readToken() {
   return localStorage.getItem('fyx_token') || ''
 }
 
-/** POST /api/ai/chat 并解析 SSE，逐段回调 delta */
+/** POST /api/ai/chat 并解析 SSE，逐段回调 delta（自动丢弃 reasoning_content/reasoning） */
 async function streamChat(messages: Msg[], onDelta: (s: string) => void) {
   const res = await fetch('/api/ai/chat', {
     method: 'POST',
@@ -60,6 +197,7 @@ async function streamChat(messages: Msg[], onDelta: (s: string) => void) {
         if (data === '[DONE]') return
         try {
           const j = JSON.parse(data)
+          // 显式丢弃 reasoning_content / reasoning 思考过程
           const d = j.choices?.[0]?.delta?.content
           if (d) onDelta(String(d))
         } catch { /* keep-alive / partial */ }
@@ -120,7 +258,11 @@ export default function AiAssistant() {
     try {
       const raw = localStorage.getItem(LS_MSGS)
       const list = raw ? (JSON.parse(raw) as Msg[]) : []
-      return Array.isArray(list) ? list.slice(-40) : []
+      if (!Array.isArray(list)) return []
+      return list.slice(-40).map((m) => ({
+        ...m,
+        content: m.role === 'assistant' ? stripThinking(m.content) : m.content,
+      }))
     } catch {
       return []
     }
@@ -197,33 +339,45 @@ export default function AiAssistant() {
     setDraft('')
     setBusy(true)
     setStreaming(true)
-    let acc = ''
+    let rawAcc = ''
     let started = false
     try {
       await streamChat(history, (d) => {
+        rawAcc += d
+        // 自动识别并丢弃思考过程（流式）
+        const cleaned = stripThinking(rawAcc, true)
+        if (!cleaned) {
+          // 尚处于思考阶段，UI 维持“AI 正在思考…”加载动效
+          return
+        }
         if (!started) {
           started = true
-          setMsgs((l) => [...l, { role: 'assistant', content: d }])
-          acc = d
+          setMsgs((l) => [...l, { role: 'assistant', content: cleaned }])
         } else {
-          acc += d
           setMsgs((l) => {
             const next = [...l]
-            next[next.length - 1] = { role: 'assistant', content: acc }
+            next[next.length - 1] = { role: 'assistant', content: cleaned }
             return next
           })
         }
       })
-      if (!started) {
-        // 上游没给内容（例如只回了 role）——给个空助手帧避免卡在 loading
-        setMsgs((l) => [...l, { role: 'assistant', content: '…' }])
-      }
-    } catch (e) {
-      toast.error((e as Error).message)
+      const finalCleaned = stripThinking(rawAcc, false)
       if (started) {
         setMsgs((l) => {
           const next = [...l]
-          next[next.length - 1] = { role: 'assistant', content: `${acc}\n\n⚠️ ${(e as Error).message}` }
+          next[next.length - 1] = { role: 'assistant', content: finalCleaned || '…' }
+          return next
+        })
+      } else {
+        setMsgs((l) => [...l, { role: 'assistant', content: finalCleaned || '…' }])
+      }
+    } catch (e) {
+      toast.error((e as Error).message)
+      const currentText = stripThinking(rawAcc, false)
+      if (started) {
+        setMsgs((l) => {
+          const next = [...l]
+          next[next.length - 1] = { role: 'assistant', content: `${currentText}\n\n⚠️ ${(e as Error).message}` }
           return next
         })
       }
@@ -562,24 +716,25 @@ export default function AiAssistant() {
                   {msgs.map((m, i) => (
                     <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                       <div
-                        className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-[13.5px] leading-relaxed break-words ${
+                        className={`max-w-[88%] rounded-2xl px-3.5 py-2.5 text-[13.5px] leading-relaxed break-words ${
                           m.role === 'user'
                             ? 'rounded-br-md bg-[var(--fyx-accent)] whitespace-pre-wrap text-black'
-                            : 'rounded-bl-md border border-white/8 bg-white/6 text-white/85'
+                            : 'rounded-bl-md border border-white/8 bg-white/6 text-white/90'
                         }`}
                       >
-                        {m.role === 'user' ? m.content : <MdInline text={m.content} breaks />}
+                        {m.role === 'user' ? m.content : <AiMarkdown content={m.content} />}
                       </div>
                     </div>
                   ))}
                   {busy && msgs[msgs.length - 1]?.role === 'user' && (
                     <div className="flex justify-start">
-                      <div className="rounded-2xl rounded-bl-md border border-white/8 bg-white/6 px-4 py-3">
+                      <div className="flex items-center gap-2 rounded-2xl rounded-bl-md border border-white/8 bg-white/6 px-4 py-2.5 text-[12px] text-white/60">
                         <span className="inline-flex gap-1">
-                          <i className="size-1.5 animate-bounce rounded-full bg-white/50 [animation-delay:0ms]" />
-                          <i className="size-1.5 animate-bounce rounded-full bg-white/50 [animation-delay:150ms]" />
-                          <i className="size-1.5 animate-bounce rounded-full bg-white/50 [animation-delay:300ms]" />
+                          <i className="size-1.5 animate-bounce rounded-full bg-[var(--fyx-accent)] [animation-delay:0ms]" />
+                          <i className="size-1.5 animate-bounce rounded-full bg-[var(--fyx-accent)] [animation-delay:150ms]" />
+                          <i className="size-1.5 animate-bounce rounded-full bg-[var(--fyx-accent)] [animation-delay:300ms]" />
                         </span>
+                        <span>AI 正在思考…</span>
                       </div>
                     </div>
                   )}

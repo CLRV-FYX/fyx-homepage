@@ -2,7 +2,7 @@ import express from 'express'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import multer from 'multer'
 import {
@@ -781,6 +781,186 @@ app.put('/api/ai/prefs', requireAuth, wrap(async (req, res) => {
   res.json(aiPrefsResponse(req.user))
 }))
 
+function stripThinking(text) {
+  if (!text || typeof text !== 'string') return ''
+  return text
+    .replace(/<(think|thought|thinking)[^>]*>[\s\S]*?<\/\1>/gi, '')
+    .replace(/<(think|thought|thinking)[^>]*>[\s\S]*$/gi, '')
+    .trim()
+}
+
+/**
+ * 流式 SSE 思考过程拦截与清洗转换流：
+ * 1. 自动过滤 <think>...</think>, <thought>...</thought>, <thinking>...</thinking> 思考块
+ * 2. 自动丢弃 delta 中的 reasoning_content / reasoning 独立字段
+ * 3. 跨 chunk 状态追踪：思考标签未闭合阶段的所有内容完全丢弃，闭合后立即恢复正文下发
+ */
+function createThinkingStream() {
+  let inThinking = false
+  let tagBuffer = ''
+  const openTags = ['<think', '<thought', '<thinking']
+  const closeTags = ['</think>', '</thought>', '</thinking>']
+
+  function filterText(text) {
+    tagBuffer += text
+    let output = ''
+
+    while (tagBuffer.length > 0) {
+      if (!inThinking) {
+        let earliestMatch = null
+        for (const tag of openTags) {
+          const idx = tagBuffer.toLowerCase().indexOf(tag)
+          if (idx !== -1) {
+            if (earliestMatch === null || idx < earliestMatch.index) {
+              earliestMatch = { index: idx, tag }
+            }
+          }
+        }
+
+        if (earliestMatch === null) {
+          let potentialTagLen = 0
+          for (let i = 1; i <= Math.min(tagBuffer.length, 10); i++) {
+            const tail = tagBuffer.slice(-i).toLowerCase()
+            if ('<thinking>'.startsWith(tail) || '<thought>'.startsWith(tail) || '<think>'.startsWith(tail)) {
+              potentialTagLen = i
+              break
+            }
+          }
+          if (potentialTagLen > 0) {
+            output += tagBuffer.slice(0, tagBuffer.length - potentialTagLen)
+            tagBuffer = tagBuffer.slice(tagBuffer.length - potentialTagLen)
+            break
+          } else {
+            output += tagBuffer
+            tagBuffer = ''
+            break
+          }
+        } else {
+          output += tagBuffer.slice(0, earliestMatch.index)
+          tagBuffer = tagBuffer.slice(earliestMatch.index)
+          const closeBracket = tagBuffer.indexOf('>')
+          if (closeBracket !== -1) {
+            inThinking = true
+            tagBuffer = tagBuffer.slice(closeBracket + 1)
+          } else {
+            break
+          }
+        }
+      } else {
+        let earliestClose = null
+        for (const tag of closeTags) {
+          const idx = tagBuffer.toLowerCase().indexOf(tag)
+          if (idx !== -1) {
+            if (earliestClose === null || idx < earliestClose.index) {
+              earliestClose = { index: idx, len: tag.length }
+            }
+          }
+        }
+
+        if (earliestClose !== null) {
+          inThinking = false
+          tagBuffer = tagBuffer.slice(earliestClose.index + earliestClose.len)
+          if (tagBuffer.startsWith('\r\n')) tagBuffer = tagBuffer.slice(2)
+          else if (tagBuffer.startsWith('\n')) tagBuffer = tagBuffer.slice(1)
+        } else {
+          let potentialCloseLen = 0
+          for (let i = 1; i <= Math.min(tagBuffer.length, 11); i++) {
+            const tail = tagBuffer.slice(-i).toLowerCase()
+            for (const tag of closeTags) {
+              if (tag.startsWith(tail)) {
+                potentialCloseLen = Math.max(potentialCloseLen, i)
+              }
+            }
+          }
+          if (potentialCloseLen > 0) {
+            tagBuffer = tagBuffer.slice(-potentialCloseLen)
+          } else {
+            tagBuffer = ''
+          }
+          break
+        }
+      }
+    }
+    return output
+  }
+
+  function flushText() {
+    let out = ''
+    if (!inThinking) {
+      out = tagBuffer
+    }
+    tagBuffer = ''
+    return out
+  }
+
+  let lineBuffer = ''
+
+  return new Transform({
+    transform(chunk, encoding, callback) {
+      lineBuffer += chunk.toString('utf8')
+      let idx
+      while ((idx = lineBuffer.indexOf('\n\n')) !== -1) {
+        const sseEvent = lineBuffer.slice(0, idx)
+        lineBuffer = lineBuffer.slice(idx + 2)
+
+        const lines = sseEvent.split('\n')
+        for (const line of lines) {
+          if (!line.startsWith('data:')) {
+            this.push(line + '\n')
+            continue
+          }
+          const rawData = line.slice(5).trim()
+          if (rawData === '[DONE]') {
+            const remaining = flushText()
+            if (remaining) {
+              const fakeChunk = { choices: [{ delta: { content: remaining } }] }
+              this.push('data: ' + JSON.stringify(fakeChunk) + '\n\n')
+            }
+            this.push('data: [DONE]\n\n')
+            continue
+          }
+
+          try {
+            const json = JSON.parse(rawData)
+            const choice = json.choices?.[0]
+            if (choice?.delta) {
+              delete choice.delta.reasoning_content
+              delete choice.delta.reasoning
+
+              const content = choice.delta.content
+              if (typeof content === 'string') {
+                const cleaned = filterText(content)
+                if (cleaned) {
+                  choice.delta.content = cleaned
+                  this.push('data: ' + JSON.stringify(json) + '\n\n')
+                }
+              } else if (choice.finish_reason) {
+                this.push('data: ' + JSON.stringify(json) + '\n\n')
+              }
+            } else {
+              this.push(line + '\n\n')
+            }
+          } catch {
+            this.push(line + '\n\n')
+          }
+        }
+      }
+      callback()
+    },
+    flush(callback) {
+      const remaining = flushText()
+      if (remaining) {
+        const fakeChunk = { choices: [{ delta: { content: remaining } }] }
+        this.push('data: ' + JSON.stringify(fakeChunk) + '\n\n')
+      }
+      if (lineBuffer.trim()) {
+        this.push(lineBuffer)
+      }
+      callback()
+    },
+  })
+}
+
 app.post('/api/ai/chat', requireAuth, wrap(async (req, res) => {
   if (db.config.ai && db.config.ai.enabled === false) fail(403, 'AI 助手已被管理员关闭')
   const eff = resolveAiFor(req.user)
@@ -804,6 +984,14 @@ app.post('/api/ai/chat', requireAuth, wrap(async (req, res) => {
     const data = await upstream.json().catch(() => null)
     done()
     if (!data) fail(502, '上游返回了无法解析的数据')
+    const choice = data.choices?.[0]
+    if (choice?.message) {
+      if (typeof choice.message.content === 'string') {
+        choice.message.content = stripThinking(choice.message.content)
+      }
+      delete choice.message.reasoning_content
+      delete choice.message.reasoning
+    }
     return res.json(data)
   }
 
@@ -812,10 +1000,11 @@ app.post('/api/ai/chat', requireAuth, wrap(async (req, res) => {
   res.setHeader('Connection', 'keep-alive')
   res.setHeader('X-Accel-Buffering', 'no') // 反代（nginx）不缓冲，保证逐字输出
   const node = Readable.fromWeb(upstream.body)
-  node.pipe(res)
-  node.on('end', done)
-  node.on('error', () => { done(); res.end() })
-  res.on('close', () => { done(); node.destroy() })
+  const filterStream = createThinkingStream()
+  node.pipe(filterStream).pipe(res)
+  filterStream.on('end', done)
+  filterStream.on('error', () => { done(); res.end() })
+  res.on('close', () => { done(); node.destroy(); filterStream.destroy() })
 }))
 
 app.post('/api/ai/test', requireAuth, wrap(async (req, res) => {
@@ -830,11 +1019,12 @@ app.post('/api/ai/test', requireAuth, wrap(async (req, res) => {
   const data = await upstream.json().catch(() => null)
   done()
   if (!data) fail(502, '上游返回了无法解析的数据')
+  const rawReply = String(data.choices?.[0]?.message?.content ?? '')
   res.json({
     ok: true,
     ms: Date.now() - t0,
     model: data.model || eff.model,
-    reply: String(data.choices?.[0]?.message?.content ?? '').slice(0, 200),
+    reply: stripThinking(rawReply).slice(0, 200) || '正常',
   })
 }))
 
