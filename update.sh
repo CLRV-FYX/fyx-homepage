@@ -50,7 +50,8 @@ show_help() {
   -h, --help      显示本帮助信息并退出
   --repo=URL      指定远程仓库地址（默认: https://github.com/CLRV-FYX/fyx-homepage.git）
   --registry=URL  指定 npm 源（默认: https://registry.npmmirror.com）
-  --no-build      仅拉取代码与安装依赖，跳过前端构建 (npm run build)
+  --build         强制在本地重新执行前端构建 (npm run build)
+  --no-build      跳过前端构建
   --no-install    跳过 npm install
   --force         强制覆盖本地修改（注意：db.json 仍会被自动备份）
 
@@ -58,7 +59,6 @@ show_help() {
   ./update.sh                                # 默认从 arena/8cd56a9a-fyx-homepage 拉取更新（使用 npmmirror 源）
   ./update.sh main                           # 从 main 分支拉取更新
   ./update.sh arena/8cd56a9a-fyx-homepage    # 显式指定从当前对话分支拉取
-  ./update.sh main --no-build                # 更新 main 分支但跳过构建
 EOF
 }
 
@@ -69,6 +69,7 @@ REPO_URL="$DEFAULT_REPO_URL"
 TARGET_BRANCH=""
 NPM_REGISTRY="https://registry.npmmirror.com"
 SKIP_BUILD=false
+FORCE_BUILD=false
 SKIP_INSTALL=false
 FORCE_PULL=false
 
@@ -84,6 +85,9 @@ for arg in "$@"; do
       ;;
     --registry=*)
       NPM_REGISTRY="${arg#*=}"
+      ;;
+    --build)
+      FORCE_BUILD=true
       ;;
     --no-build)
       SKIP_BUILD=true
@@ -285,16 +289,25 @@ else
   info "跳过依赖安装 (--no-install)"
 fi
 
-# 8. 构建前端产物
-if [ "$SKIP_BUILD" = false ]; then
+# 8. 前端构建处理
+# 本项目已随分支内置了最新同步的生产构建资源 (dist/)。
+# 若源码完整（存在 src/pages/Home.tsx）且未声明跳过，或指定了 --build 选项时执行构建；
+# 否则直接使用内置的高质量 dist/ 资源，避免不必要的重复编译与源码缺失报错。
+if [ "$FORCE_BUILD" = true ] || ([ "$SKIP_BUILD" = false ] && [ -f "$PROJECT_DIR/src/pages/Home.tsx" ]); then
   info "正在执行前端构建 (npm run build) ..."
   if npm run build; then
     success "前端构建完成 (dist/)！"
+  elif [ -f "$PROJECT_DIR/dist/index.html" ]; then
+    warn "npm run build 异常，已回退直接使用内置 dist/ 资源，服务依然可正常运行。"
   else
-    warn "npm run build 构建失败，若已包含 pre-built dist 资源服务可能仍可运行。"
+    error "前端构建失败且未找到 dist 资源，请检查构建环境！"
+    exit 1
   fi
+elif [ -f "$PROJECT_DIR/dist/index.html" ]; then
+  info "检测到生产环境内置预构建资源已就绪 (dist/)，直接使用现有资源启动。"
 else
-  info "跳过前端构建 (--no-build)"
+  info "正在执行前端构建 (npm run build) ..."
+  npm run build
 fi
 
 # 9. 服务状态检查与提示
