@@ -41,12 +41,14 @@ show_help() {
 说明:
   从指定的 Git 分支拉取最新代码，自动备份数据、安装依赖并构建。
   如果不传分支名，默认使用当前对话分支: arena/8cd56a9a-fyx-homepage
+  【支持 ZIP 部署环境】：若当前目录非 Git 仓库，脚本会自动初始化 Git 关联远程并同步！
 
 参数:
   分支名          可选。远程分支名称（例如: arena/8cd56a9a-fyx-homepage, main）
 
 选项:
   -h, --help      显示本帮助信息并退出
+  --repo=URL      指定远程仓库地址（默认: https://github.com/CLRV-FYX/fyx-homepage.git）
   --registry=URL  指定 npm 源（默认: https://registry.npmmirror.com）
   --no-build      仅拉取代码与安装依赖，跳过前端构建 (npm run build)
   --no-install    跳过 npm install
@@ -62,6 +64,8 @@ EOF
 
 # 默认分支设置为当前对话分支
 DEFAULT_BRANCH="arena/8cd56a9a-fyx-homepage"
+DEFAULT_REPO_URL="https://github.com/CLRV-FYX/fyx-homepage.git"
+REPO_URL="$DEFAULT_REPO_URL"
 TARGET_BRANCH=""
 NPM_REGISTRY="https://registry.npmmirror.com"
 SKIP_BUILD=false
@@ -74,6 +78,9 @@ for arg in "$@"; do
     -h|--help)
       show_help
       exit 0
+      ;;
+    --repo=*)
+      REPO_URL="${arg#*=}"
       ;;
     --registry=*)
       NPM_REGISTRY="${arg#*=}"
@@ -119,91 +126,135 @@ for cmd in git node npm; do
   fi
 done
 
-# 3. 检查 Git 仓库状态
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  error "当前目录不是有效的 Git 仓库: $PROJECT_DIR"
-  exit 1
-fi
-
-REMOTE_NAME="origin"
-if ! git remote | grep -q "^${REMOTE_NAME}$"; then
-  REMOTE_NAME="$(git remote | head -n 1)"
-  if [ -z "$REMOTE_NAME" ]; then
-    error "未找到任何 Git Remote 远程仓库配置！"
-    exit 1
-  fi
-  warn "未找到 origin，改用远程仓库: $REMOTE_NAME"
-fi
-
-# 4. 安全保护：备份 server/data/ 中的核心数据 (db.json, secret)
+# 3. 检查与准备 Git 仓库状态（支持非 Git / ZIP 解压目录自动转为 Git 仓库）
 DATA_DIR="$PROJECT_DIR/server/data"
 BACKUP_DIR="$DATA_DIR/backups"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
-if [ -f "$DATA_DIR/db.json" ]; then
-  mkdir -p "$BACKUP_DIR"
-  cp "$DATA_DIR/db.json" "$BACKUP_DIR/db_${TIMESTAMP}.json"
-  info "已自动备份当前数据库: server/data/backups/db_${TIMESTAMP}.json"
-fi
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  warn "检测到当前目录不是 Git 仓库（可能是通过 ZIP 压缩包下载解压部署的）。"
+  info "正在自动初始化 Git 并关联远程仓库: $REPO_URL ..."
 
-if [ -f "$DATA_DIR/secret" ]; then
-  mkdir -p "$BACKUP_DIR"
-  cp "$DATA_DIR/secret" "$BACKUP_DIR/secret_${TIMESTAMP}"
-fi
-
-# 5. 拉取远程分支最新状态
-info "正在从远程仓库 ($REMOTE_NAME) 获取分支信息: $TARGET_BRANCH ..."
-if ! git fetch "$REMOTE_NAME" "$TARGET_BRANCH" --tags; then
-  error "获取远程分支 $TARGET_BRANCH 失败，请检查网络连接及分支名称是否存在。"
-  exit 1
-fi
-
-# 6. 处理本地工作区变动并切换分支
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
-HAS_DIRTY_CHANGES=false
-
-if [ -n "$(git status --porcelain)" ]; then
-  HAS_DIRTY_CHANGES=true
-fi
-
-if [ "$FORCE_PULL" = true ]; then
-  warn "启用了 --force 选项，将丢弃工作区中未提交的代码变更（数据库已在上方备份）"
-  git reset --hard HEAD
-elif [ "$HAS_DIRTY_CHANGES" = true ]; then
-  info "检测到本地工作区存在变动，执行 git stash 暂存修改..."
-  git stash push -m "update.sh auto-stash before updating to $TARGET_BRANCH at $TIMESTAMP"
-fi
-
-# 切换或检出分支
-if [ "$CURRENT_BRANCH" != "$TARGET_BRANCH" ]; then
-  info "正在切换分支: $CURRENT_BRANCH -> $TARGET_BRANCH ..."
-  if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
-    git checkout "$TARGET_BRANCH"
-  else
-    git checkout -b "$TARGET_BRANCH" "$REMOTE_NAME/$TARGET_BRANCH"
+  # 临时安全保存已有数据库与敏感数据
+  TEMP_BACKUP_DIR="/tmp/fyx_data_save_$$_${TIMESTAMP}"
+  mkdir -p "$TEMP_BACKUP_DIR"
+  if [ -f "$DATA_DIR/db.json" ]; then
+    cp "$DATA_DIR/db.json" "$TEMP_BACKUP_DIR/db.json"
+    info "已暂存现有用户数据库 server/data/db.json"
   fi
-fi
+  if [ -f "$DATA_DIR/secret" ]; then
+    cp "$DATA_DIR/secret" "$TEMP_BACKUP_DIR/secret"
+  fi
 
-# 拉取合并更新
-info "正在合并最新代码 ($REMOTE_NAME/$TARGET_BRANCH) ..."
-if [ "$FORCE_PULL" = true ]; then
-  git reset --hard "$REMOTE_NAME/$TARGET_BRANCH"
+  # 初始化 Git 仓库并设置远程地址
+  git init
+  git remote remove origin 2>/dev/null || true
+  git remote add origin "$REPO_URL"
+
+  # 拉取目标分支
+  info "正在从远程仓库获取分支最新状态: $TARGET_BRANCH ..."
+  if ! git fetch origin "$TARGET_BRANCH" --tags; then
+    error "获取远程分支 $TARGET_BRANCH 失败！请检查服务器出网连接是否可访问 GitHub。"
+    rm -rf "$TEMP_BACKUP_DIR"
+    exit 1
+  fi
+
+  # 强制切换检出远程目标分支，覆盖解压出的旧文件
+  info "正在检出并关联远程分支: $TARGET_BRANCH ..."
+  git checkout -f -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH"
+
+  # 还原并备份用户业务数据
+  if [ -f "$TEMP_BACKUP_DIR/db.json" ]; then
+    mkdir -p "$BACKUP_DIR"
+    cp "$TEMP_BACKUP_DIR/db.json" "$DATA_DIR/db.json"
+    cp "$TEMP_BACKUP_DIR/db.json" "$BACKUP_DIR/db_${TIMESTAMP}.json"
+    success "已保留并恢复本地原有数据库（并备份至 server/data/backups/db_${TIMESTAMP}.json）"
+  fi
+  if [ -f "$TEMP_BACKUP_DIR/secret" ]; then
+    cp "$TEMP_BACKUP_DIR/secret" "$DATA_DIR/secret"
+  fi
+  rm -rf "$TEMP_BACKUP_DIR"
+
+  success "已成功将本目录转换为 Git 仓库并与分支 $TARGET_BRANCH 同步完成！"
 else
-  # 优先采用快进合并，若无法快进则常规合并
-  if ! git merge --ff-only "$REMOTE_NAME/$TARGET_BRANCH" 2>/dev/null; then
-    warn "无法进行快进合并 (Fast-Forward)，尝试普通合并..."
-    git merge "$REMOTE_NAME/$TARGET_BRANCH" --no-edit || {
-      error "代码合并发生冲突！请手动检查并解决冲突后重新运行。"
-      exit 1
-    }
+  # 针对已有 Git 仓库的更新流程
+  REMOTE_NAME="origin"
+  if ! git remote | grep -q "^${REMOTE_NAME}$"; then
+    REMOTE_NAME="$(git remote | head -n 1)"
+    if [ -z "$REMOTE_NAME" ]; then
+      warn "未检测到远程仓库，正在自动配置 origin -> $REPO_URL"
+      git remote add origin "$REPO_URL"
+      REMOTE_NAME="origin"
+    else
+      warn "未找到 origin，改用远程仓库: $REMOTE_NAME"
+    fi
   fi
-fi
 
-# 恢复暂存的内容（如果有）
-if [ "$HAS_DIRTY_CHANGES" = true ] && [ "$FORCE_PULL" = false ]; then
-  info "正在恢复此前暂存的本地修改..."
-  if ! git stash pop 2>/dev/null; then
-    warn "恢复 stash 存在冲突，已保留 stash 记录，请手动检查 git status"
+  # 4. 安全保护：备份 server/data/ 中的核心数据 (db.json, secret)
+  if [ -f "$DATA_DIR/db.json" ]; then
+    mkdir -p "$BACKUP_DIR"
+    cp "$DATA_DIR/db.json" "$BACKUP_DIR/db_${TIMESTAMP}.json"
+    info "已自动备份当前数据库: server/data/backups/db_${TIMESTAMP}.json"
+  fi
+
+  if [ -f "$DATA_DIR/secret" ]; then
+    mkdir -p "$BACKUP_DIR"
+    cp "$DATA_DIR/secret" "$BACKUP_DIR/secret_${TIMESTAMP}"
+  fi
+
+  # 5. 拉取远程分支最新状态
+  info "正在从远程仓库 ($REMOTE_NAME) 获取分支信息: $TARGET_BRANCH ..."
+  if ! git fetch "$REMOTE_NAME" "$TARGET_BRANCH" --tags; then
+    error "获取远程分支 $TARGET_BRANCH 失败，请检查网络连接及分支名称是否存在。"
+    exit 1
+  fi
+
+  # 6. 处理本地工作区变动并切换分支
+  CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+  HAS_DIRTY_CHANGES=false
+
+  if [ -n "$(git status --porcelain)" ]; then
+    HAS_DIRTY_CHANGES=true
+  fi
+
+  if [ "$FORCE_PULL" = true ]; then
+    warn "启用了 --force 选项，将丢弃工作区中未提交的代码变更（数据库已在上方备份）"
+    git reset --hard HEAD
+  elif [ "$HAS_DIRTY_CHANGES" = true ]; then
+    info "检测到本地工作区存在变动，执行 git stash 暂存修改..."
+    git stash push -m "update.sh auto-stash before updating to $TARGET_BRANCH at $TIMESTAMP"
+  fi
+
+  # 切换或检出分支
+  if [ "$CURRENT_BRANCH" != "$TARGET_BRANCH" ]; then
+    info "正在切换分支: $CURRENT_BRANCH -> $TARGET_BRANCH ..."
+    if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+      git checkout "$TARGET_BRANCH"
+    else
+      git checkout -b "$TARGET_BRANCH" "$REMOTE_NAME/$TARGET_BRANCH"
+    fi
+  fi
+
+  # 拉取合并更新
+  info "正在合并最新代码 ($REMOTE_NAME/$TARGET_BRANCH) ..."
+  if [ "$FORCE_PULL" = true ]; then
+    git reset --hard "$REMOTE_NAME/$TARGET_BRANCH"
+  else
+    if ! git merge --ff-only "$REMOTE_NAME/$TARGET_BRANCH" 2>/dev/null; then
+      warn "无法进行快进合并 (Fast-Forward)，尝试普通合并..."
+      git merge "$REMOTE_NAME/$TARGET_BRANCH" --no-edit || {
+        error "代码合并发生冲突！请手动检查并解决冲突后重新运行。"
+        exit 1
+      }
+    fi
+  fi
+
+  # 恢复暂存的内容（如果有）
+  if [ "$HAS_DIRTY_CHANGES" = true ] && [ "$FORCE_PULL" = false ]; then
+    info "正在恢复此前暂存的本地修改..."
+    if ! git stash pop 2>/dev/null; then
+      warn "恢复 stash 存在冲突，已保留 stash 记录，请手动检查 git status"
+    fi
   fi
 fi
 
