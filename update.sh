@@ -112,6 +112,11 @@ fi
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
+# 自动处理 Git safe.directory 检查（彻底避免宝塔面板、容器或 root/www 用户权限不一致时的 dubious ownership 拦截）
+if command -v git >/dev/null 2>&1; then
+  git config --global --add safe.directory "$PROJECT_DIR" 2>/dev/null || true
+fi
+
 echo -e "${COLOR_BOLD}======================================================${COLOR_RESET}"
 echo -e "${COLOR_BOLD}  FYX 个人主页 · 自动更新程序${COLOR_RESET}"
 echo -e "  目标更新分支: ${COLOR_BLUE}${TARGET_BRANCH}${COLOR_RESET}"
@@ -131,8 +136,16 @@ DATA_DIR="$PROJECT_DIR/server/data"
 BACKUP_DIR="$DATA_DIR/backups"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
+NEED_INITIAL_SETUP=false
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  NEED_INITIAL_SETUP=true
   warn "检测到当前目录不是 Git 仓库（可能是通过 ZIP 压缩包下载解压部署的）。"
+elif ! git rev-parse HEAD >/dev/null 2>&1; then
+  NEED_INITIAL_SETUP=true
+  warn "检测到本地 Git 仓库尚未完成首次分支检出。"
+fi
+
+if [ "$NEED_INITIAL_SETUP" = true ]; then
   info "正在自动初始化 Git 并关联远程仓库: $REPO_URL ..."
 
   # 临时安全保存已有数据库与敏感数据
@@ -148,6 +161,7 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 
   # 初始化 Git 仓库并设置远程地址
   git init
+  git config --global --add safe.directory "$PROJECT_DIR" 2>/dev/null || true
   git remote remove origin 2>/dev/null || true
   git remote add origin "$REPO_URL"
 
