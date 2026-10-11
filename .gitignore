@@ -22,5 +22,6 @@ dist-ssr
 *.sln
 *.sw?
 
-# Backup data
+# Backup data & runtime uploads
 server/data/backups/
+server/data/uploads/
